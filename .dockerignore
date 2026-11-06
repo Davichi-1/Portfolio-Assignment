@@ -1,0 +1,11 @@
+.git
+.github
+scripts
+README.md
+.gitignore
+.dockerignore
+Dockerfile
+*.pem
+*.key
+.env
+.env.*

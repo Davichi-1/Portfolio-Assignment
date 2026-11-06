@@ -1,0 +1,101 @@
+name: Build and deploy portfolio
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+# Only one deployment at a time, and never cancel one halfway through.
+concurrency:
+  group: production-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: portfolio
+  CONTAINER_NAME: portfolio
+  HOST_PORT: "8080"
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Check out the code
+        uses: actions/checkout@v4
+
+      - name: Validate the site files
+        run: bash scripts/validate.sh
+
+      - name: Build the Docker image (tagged with the commit SHA)
+        run: docker build --build-arg GIT_SHA="$GITHUB_SHA" -t "$IMAGE_NAME:$GITHUB_SHA" .
+
+      - name: Smoke test the container on the runner
+        run: |
+          docker run -d --name smoke -p 8081:80 "$IMAGE_NAME:$GITHUB_SHA"
+          for i in $(seq 1 15); do
+            curl -fsS http://localhost:8081/healthz && break
+            sleep 2
+          done
+          curl -fsS http://localhost:8081/healthz
+          test "$(curl -fsS http://localhost:8081/version.txt | tr -d '\n')" = "$GITHUB_SHA"
+          curl -fsS http://localhost:8081/ | grep -q "David Chidera Tobias"
+          docker rm -f smoke
+
+      - name: Set up SSH with host key verification
+        env:
+          EC2_SSH_KEY: ${{ secrets.EC2_SSH_KEY }}
+          EC2_KNOWN_HOSTS: ${{ secrets.EC2_KNOWN_HOSTS }}
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$EC2_SSH_KEY" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          printf '%s\n' "$EC2_KNOWN_HOSTS" > ~/.ssh/known_hosts
+          chmod 644 ~/.ssh/known_hosts
+
+      - name: Send the image to EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          docker save "$IMAGE_NAME:$GITHUB_SHA" | gzip | ssh \
+            -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            "$EC2_USER@$EC2_HOST" 'gunzip | docker load'
+
+      - name: Start the new container on EC2
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+          EC2_USER: ${{ secrets.EC2_USER }}
+        run: |
+          ssh -i ~/.ssh/deploy_key -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes \
+            "$EC2_USER@$EC2_HOST" \
+            "SHA=$GITHUB_SHA NAME=$CONTAINER_NAME IMG=$IMAGE_NAME PORT=$HOST_PORT bash -s" <<'REMOTE'
+          set -euo pipefail
+          DIR="$HOME/portfolio-deploy"
+          mkdir -p "$DIR"
+          PREV="$(cat "$DIR/current_sha" 2>/dev/null || true)"
+          docker rm -f "$NAME" 2>/dev/null || true
+          docker run -d --name "$NAME" --restart unless-stopped -p "$PORT:80" "$IMG:$SHA"
+          if [ -n "$PREV" ] && [ "$PREV" != "$SHA" ]; then echo "$PREV" > "$DIR/previous_sha"; fi
+          echo "$SHA" > "$DIR/current_sha"
+          # Keep the 3 newest images so there is always something to roll back to.
+          docker images "$IMG" --format '{{.CreatedAt}}|{{.ID}}' | sort -r | tail -n +4 | cut -d'|' -f2 | xargs -r docker rmi -f || true
+          REMOTE
+
+      - name: Check the public website
+        env:
+          EC2_HOST: ${{ secrets.EC2_HOST }}
+        run: |
+          URL="http://$EC2_HOST:$HOST_PORT"
+          ok=0
+          for i in $(seq 1 20); do
+            if curl -fsS --max-time 5 "$URL/healthz" > /dev/null; then ok=1; break; fi
+            sleep 3
+          done
+          [ "$ok" -eq 1 ] || { echo "Health check failed: the site did not answer"; exit 1; }
+          live="$(curl -fsS --max-time 5 "$URL/version.txt" | tr -d '\n')"
+          [ "$live" = "$GITHUB_SHA" ] || { echo "Wrong release is live: $live"; exit 1; }
+          curl -fsS --max-time 5 "$URL/" | grep -q "David Chidera Tobias" || { echo "Home page content check failed"; exit 1; }
+          echo "Release $live is live and healthy."
